@@ -1,0 +1,566 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OSM 地图生成器</title>
+<style>
+/* SECTION: styles */
+:root{
+  --bg:#0f1115; --panel:#1a1e26; --line:#2a303c; --text:#e8ecf2; --muted:#9aa4b2;
+  --accent:#10b981; --err:#f87171; --ok:#34d399;
+}
+*{box-sizing:border-box; margin:0; padding:0}
+body{background:var(--bg); color:var(--text); font:15px/1.6 system-ui,"PingFang SC","Microsoft YaHei",sans-serif; min-height:100vh; padding:20px}
+.wrap{max-width:860px; margin:0 auto}
+h1{font-size:22px; margin-bottom:4px}
+.sub{color:var(--muted); font-size:13px; margin-bottom:18px}
+.panel{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; margin-bottom:16px}
+.row{display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end; margin-bottom:12px}
+.field{display:flex; flex-direction:column; gap:4px; flex:1; min-width:140px}
+.field label{font-size:13px; color:var(--muted)}
+.field input{background:var(--bg); border:1px solid var(--line); color:var(--text); border-radius:8px; padding:10px 12px; font-size:16px; min-height:44px}
+.btn{display:inline-flex; align-items:center; justify-content:center; gap:8px; background:var(--accent); color:#06231a; border:0; border-radius:8px; padding:12px 22px; font-size:16px; font-weight:600; cursor:pointer; min-height:44px}
+.btn:disabled{opacity:.45; cursor:not-allowed}
+.btn.ghost{background:var(--bg); color:var(--text); border:1px solid var(--line)}
+.logo{width:16px; height:16px}
+#log{background:#0b0d11; border:1px solid var(--line); border-radius:8px; padding:12px; height:220px; overflow:auto; font:12px/1.7 ui-monospace,monospace; white-space:pre-wrap}
+#log .ok{color:var(--ok)} #log .err{color:var(--err)} #log .muted{color:var(--muted)}
+.hint{color:var(--muted); font-size:12px; margin-top:12px}
+#fileList{margin-top:10px; font-size:13px}
+.note{border-left:3px solid var(--accent); background:rgba(16,185,129,.08); padding:10px 14px; border-radius:6px; font-size:13px; color:var(--muted); margin-bottom:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <!-- SECTION: layout -->
+  <h1>🌍 OSM 地图生成器</h1>
+  <p class="sub">把真实世界任意区域一键变成《城市天际线 1》可导入的地图文件（高度图 / 水域 / 树木 / 路网 / 说明）</p>
+
+  <div class="note" id="compatNote">检测浏览器兼容性中…（需要桌面版 Chrome 或 Edge，支持“选择目录写入文件”）</div>
+
+  <div class="panel">
+    <div class="row">
+      <div class="field" style="flex:0 0 auto">
+        <label>保存根目录</label>
+        <button class="btn ghost" id="pickDirBtn" type="button">📁 选择目录</button>
+      </div>
+      <div class="field">
+        <label>中心经度（东经为正）</label>
+        <input id="lon" type="number" step="any" value="116.3975" inputmode="decimal">
+      </div>
+      <div class="field">
+        <label>中心纬度（北纬为正）</label>
+        <input id="lat" type="number" step="any" value="39.9087" inputmode="decimal">
+      </div>
+      <div class="field" style="flex:0 0 auto">
+        <label>地图框（固定）</label>
+        <div style="background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px 12px; font-size:16px; min-height:44px; line-height:1.3">
+          17.28 × 17.28 km<br><span style="font-size:12px; color:var(--muted)">适配 C:S1 完整地图 9×9 格</span>
+        </div>
+      </div>
+    </div>
+    <button class="btn" id="genBtn" type="button" data-primary-action disabled>🚀 生成地图（5 个文件）</button>
+  </div>
+
+  <div class="panel">
+    <div class="row" style="margin-bottom:6px"><label style="color:var(--muted);font-size:13px">生成日志</label></div>
+    <div id="log" aria-live="polite"></div>
+    <div id="fileList" class="hint"></div>
+  </div>
+
+  <p class="hint">流程：选择保存目录 → 填中心坐标 → 点击生成。地图框固定为 17.28km×17.28km（适配《城市天际线 1》完整地图）。工具会访问 OpenStreetMap(Overpass) 与 AWS Terrarium DEM 公共接口获取真实数据（需联网），随后在你选择的目录下生成 Heightmaps/Map.png、Maps/Water.png、Maps/Trees.png、Data/road_network.json、README_IMPORT_INSTRUCTIONS.txt。高度图为 16 位灰度（1081×1081，黑=低、白=高）。</p>
+</div>
+
+<script>
+"use strict";
+/* SECTION: state */
+let rootDir = null;           // FileSystemDirectoryHandle
+let cancelled = false;
+
+/* SECTION: ui-logic */
+const $ = (id) => document.getElementById(id);
+
+/* SECTION: core-geo */
+const M_PER_DEG_LAT = 111320;
+function lonLatToLocalMeters(lon, lat, origin){
+  const mPerDegLon = M_PER_DEG_LAT * Math.cos(origin[1] * Math.PI / 180);
+  return [(lon - origin[0]) * mPerDegLon, (lat - origin[1]) * M_PER_DEG_LAT];
+}
+
+/** 从 bbox 中心计算原点 */
+function bboxCenter(bbox){ return [(bbox[1] + bbox[3]) / 2, (bbox[0] + bbox[2]) / 2]; }
+
+/** 由中心点+边长公里 → [s,w,n,e] */
+function bboxFromCenter(lon, lat, km){
+  const half = km / 2 / 111.32;              // 纬度半宽（度）
+  const halfLon = km / 2 / (111.32 * Math.cos(lat * Math.PI / 180));
+  return [lat - half, lon - halfLon, lat + half, lon + halfLon];
+}
+
+/** Douglas-Peucker 折线简化（容差单位=度） */
+function douglasPeucker(pts, tol){
+  if (pts.length < 3) return pts;
+  const dist = (a, b, p) => Math.abs((b[0]-a[0])*(p[1]-a[1]) - (b[1]-a[1])*(p[0]-a[0]))
+      / (Math.hypot(b[0]-a[0], b[1]-a[1]) || 1e-12);
+  const keep = new Uint8Array(pts.length);
+  keep[0] = keep[pts.length-1] = 1;
+  const rec = (s, e) => {
+    if (e - s < 2) return;
+    let idx = -1, md = -1;
+    for (let i = s+1; i < e; i++){
+      const d = dist(pts[s], pts[e], pts[i]);
+      if (d > md){ md = d; idx = i; }
+    }
+    if (md > tol){ keep[idx] = 1; rec(s, idx); rec(idx, e); }
+  };
+  rec(0, pts.length-1);
+  const out = [];
+  for (let i = 0; i < pts.length; i++) if (keep[i]) out.push(pts[i]);
+  return out;
+}
+
+/* SECTION: osm-fetch */
+/** 拉取 OSM 要素（道路/建筑/水体/森林/公园），返回 [{tags, coords:[[lon,lat],...]}] */
+async function fetchOSM(bbox){
+  const [s, w, n, e] = bbox;
+  const q = "[out:json][timeout:60];(" +
+    `way["highway"](${s},${w},${n},${e});` +
+    `way["building"](${s},${w},${n},${e});` +
+    `way["natural"="water"](${s},${w},${n},${e});` +
+    `way["waterway"="riverbank"](${s},${w},${n},${e});` +
+    `way["natural"="wood"](${s},${w},${n},${e});` +
+    `way["natural"="scrub"](${s},${w},${n},${e});` +
+    `way["landuse"="forest"](${s},${w},${n},${e});` +
+    `way["leisure"="park"](${s},${w},${n},${e});` +
+    ");out body;>;out skel qt;";
+
+  let resp;
+  try{
+    resp = await fetch("https://overpass-api.de/api/interpreter",{
+      method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:"data=" + encodeURIComponent(q)
+    });
+  }catch(err){ throw new Error("无法连接 Overpass（请检查网络）: " + err.message); }
+  if(!resp.ok) throw new Error("Overpass 请求失败: " + resp.status);
+
+  const data = await resp.json();
+  const nodes = new Map();
+  for(const el of data.elements || []){
+    if(el.type === "node") nodes.set(el.id, [el.lon, el.lat]);
+  }
+  const feats = [];
+  for(const el of data.elements || []){
+    if(el.type !== "way" || !el.tags || !el.nodes) continue;
+    const coords = []; let ok = true;
+    for(const ref of el.nodes){
+      const p = nodes.get(ref);
+      if(!p){ ok = false; break; }
+      coords.push(p);
+    }
+    if(!ok || coords.length < 2) continue;
+    feats.push({ tags: el.tags, coords });
+  }
+  return feats;
+}
+
+/* SECTION: png-encode */
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for(let n = 0; n < 256; n++){
+    let c = n;
+    for(let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function crc32(bytes){
+  let c = 0xffffffff;
+  for(let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 255] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, payload){
+  const out = new Uint8Array(12 + payload.length);
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, payload.length);
+  for(let i = 0; i < 4; i++) out[4+i] = type.charCodeAt(i);
+  out.set(payload, 8);
+  const crcInput = new Uint8Array(4 + payload.length);
+  crcInput.set(out.subarray(4, 8), 0);
+  crcInput.set(payload, 4);
+  dv.setUint32(8 + payload.length, crc32(crcInput));
+  return out;
+}
+
+/** 用浏览器原生 deflate 压缩 */
+async function deflateBytes(bytes){
+  const cs = new CompressionStream("deflate");
+  const stream = new Blob([bytes]).stream().pipeThrough(cs);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/** 16 位灰度 PNG 编码（C:S 高度图/掩膜通用） */
+async function encodeGray16PNG(width, height, values){
+  if(values.length !== width * height) throw new Error("像素数量不匹配");
+  const stride = width * 2;
+  const raw = new Uint8Array((stride + 1) * height);
+  const dv = new DataView(raw.buffer);
+  for(let y = 0; y < height; y++){
+    const rs = y * (stride + 1);
+    raw[rs] = 0; // filter None
+    for(let x = 0; x < width; x++) dv.setUint16(rs + 1 + x*2, values[y*width + x]);
+  }
+  const compressed = await deflateBytes(raw);
+  const ihdr = new Uint8Array(13);
+  const idv = new DataView(ihdr.buffer);
+  idv.setUint32(0, width); idv.setUint32(4, height);
+  ihdr[8] = 16; ihdr[9] = 0; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const sig = new Uint8Array([0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a]);
+  const parts = [sig, pngChunk("IHDR", ihdr), pngChunk("IDAT", compressed), pngChunk("IEND", new Uint8Array(0))];
+  const total = parts.reduce((a, p) => a + p.length, 0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for(const p of parts){ out.set(p, o); o += p.length; }
+  return out;
+}
+
+/* SECTION: dem-fetch */
+const TILE = 256;
+
+function pickZoom(bbox, maxTiles){
+  const [s, w, n, e] = bbox;
+  for(let z = 18; z >= 6; z--){
+    const nx = Math.max(1, Math.ceil(((e-w)/360) * 2**z));
+    const ny = Math.max(1, Math.ceil(((n-s)/180) * 2**z));
+    if(nx * ny <= maxTiles) return z;
+  }
+  return 18;
+}
+function lonToTileX(lon, z){ return Math.floor(((lon+180)/360) * 2**z); }
+function latToTileY(lat, z){
+  const r = lat * Math.PI / 180;
+  return Math.floor((1 - Math.asinh(Math.tan(r)) / Math.PI) / 2 * 2**z);
+}
+function tileYToLat(y, z){
+  const n = Math.PI - 2 * Math.PI * y / 2**z;
+  return 180/Math.PI * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+}
+
+async function fetchTilePng(url){
+  const resp = await fetch(url);
+  if(!resp.ok) throw new Error("DEM 瓦片请求失败: " + url + " (" + resp.status + ")");
+  const blob = await resp.blob();
+  const bmp = await createImageBitmap(blob);
+  const c = document.createElement("canvas");
+  c.width = bmp.width; c.height = bmp.height;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0);
+  const img = ctx.getImageData(0, 0, c.width, c.height).data;
+  const elev = new Float32Array(c.width * c.height);
+  for(let i = 0; i < elev.length; i++){
+    const r = img[i*4], g = img[i*4+1], b = img[i*4+2];
+    elev[i] = r * 256 + g + b / 256 - 32768; // terrarium: R*256+G+B/256-32768
+  }
+  return { w: c.width, h: c.height, elev };
+}
+
+/** 拉取 DEM 栅格（瓦片拼接） */
+async function fetchTerrainDEM(bbox){
+  const zoom = pickZoom(bbox, 64);
+  const [s, w, n, e] = bbox;
+  const x0 = lonToTileX(w, zoom), x1 = lonToTileX(e, zoom);
+  const y0 = latToTileY(n, zoom), y1 = latToTileY(s, zoom);
+  const tilesX = x1 - x0 + 1, tilesY = y1 - y0 + 1;
+  const urls = [];
+  for(let ty = y0; ty <= y1; ty++)
+    for(let tx = x0; tx <= x1; tx++)
+      urls.push("https://s3.amazonaws.com/elevation-tiles-prod/terrarium/" + zoom + "/" + tx + "/" + ty + ".png");
+
+  const tiles = await Promise.all(urls.map(u => fetchTilePng(u)));
+  const gw = tilesX * TILE, gh = tilesY * TILE;
+  const elev = new Float32Array(gw * gh);
+  for(let ty = 0; ty < tilesY; ty++){
+    for(let tx = 0; tx < tilesX; tx++){
+      const t = tiles[ty * tilesX + tx];
+      for(let py = 0; py < TILE; py++){
+        const src = py * TILE, dst = (ty*TILE + py) * gw + tx*TILE;
+        elev.set(t.elev.subarray(src, src + TILE), dst);
+      }
+    }
+  }
+  const demNorth = tileYToLat(y0, zoom), demSouth = tileYToLat(y1 + 1, zoom);
+  const demWest = x0 / 2**zoom * 360 - 180, demEast = (x1+1) / 2**zoom * 360 - 180;
+  return { width: gw, height: gh, elev, bbox: [demSouth, demWest, demNorth, demEast] };
+}
+
+/** DEM 双线性采样（越界 clamp，NaN 兜底 0） */
+function sampleDEM(dem, lon, lat){
+  const clon = (dem.bbox[3] - dem.bbox[1]) / Math.max(1, dem.width - 1);
+  const clat = (dem.bbox[2] - dem.bbox[0]) / Math.max(1, dem.height - 1);
+  const gx = (lon - dem.bbox[1]) / clon;
+  const gy = (dem.bbox[2] - lat) / clat;
+  const x0 = Math.floor(gx), y0 = Math.floor(gy);
+  const fx = gx - x0, fy = gy - y0;
+  const i0 = Math.min(Math.max(y0,0), dem.height-1), i1 = Math.min(Math.max(y0+1,0), dem.height-1);
+  const j0 = Math.min(Math.max(x0,0), dem.width-1),  j1 = Math.min(Math.max(x0+1,0), dem.width-1);
+  const v00 = dem.elev[i0*dem.width+j0], v10 = dem.elev[i0*dem.width+j1];
+  const v01 = dem.elev[i1*dem.width+j0], v11 = dem.elev[i1*dem.width+j1];
+  const v = v00 + (v10-v00)*fx + (v01-v00)*fy + (v00-v10-v01+v11)*fx*fy;
+  return isFinite(v) ? v : 0;
+}
+
+/** 高度图 16 位灰度：地形高低直接映射灰度（黑=低，白=高），不做其他处理 */
+function buildHeightmapValues(dem, bbox, res){
+  const [s, w, n, e] = bbox;
+  const sampled = new Float32Array(res * res);
+  let min = Infinity, max = -Infinity;
+  for(let py = 0; py < res; py++){
+    const lat = n - (n - s) * py / (res - 1);
+    for(let px = 0; px < res; px++){
+      const lon = w + (e - w) * px / (res - 1);
+      const v = sampleDEM(dem, lon, lat);
+      sampled[py*res + px] = v;
+      if(v < min) min = v;
+      if(v > max) max = v;
+    }
+  }
+  const range = max - min;
+  const out = new Uint16Array(res * res);
+  for(let i = 0; i < out.length; i++){
+    out[i] = range <= 0 ? 0 : Math.round((sampled[i] - min) / range * 65535);
+  }
+  return out;
+}
+
+/* SECTION: render-masks */
+function lonLatToPixel(lon, lat, bbox, res){
+  const [s, w, n, e] = bbox;
+  return [ (lon-w)/(e-w)*res, (n-lat)/(n-s)*res ];
+}
+
+/** 把多边形环追踪为 path，返回是否有图形 */
+function traceRing(ctx, ring, bbox, res){
+  if(ring.length < 3) return false;
+  const [sx, sy] = lonLatToPixel(ring[0][0], ring[0][1], bbox, res);
+  ctx.moveTo(sx, sy);
+  for(let i = 1; i < ring.length; i++){
+    const [x, y] = lonLatToPixel(ring[i][0], ring[i][1], bbox, res);
+    ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  return true;
+}
+
+/** 水域掩膜 16 位值（白=水 65535，黑=陆 0） */
+function buildWaterValues(features, bbox, res){
+  const c = document.createElement("canvas");
+  c.width = res; c.height = res;
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, res, res);
+  ctx.fillStyle = "#fff";
+  ctx.beginPath();
+  let has = false;
+  for(const f of features){
+    if(f.tags["natural"] !== "water" && f.tags["waterway"] !== "riverbank") continue;
+    if(traceRing(ctx, f.coords, bbox, res)) has = true;
+  }
+  if(has) ctx.fill("evenodd");
+  const img = ctx.getImageData(0, 0, res, res).data;
+  const out = new Uint16Array(res * res);
+  for(let i = 0; i < out.length; i++) out[i] = img[i*4] < 128 ? 0 : 65535;
+  return out;
+}
+
+/** 树木密度掩膜 16 位值（wood=255×257、forest=230×257、scrub=160×257、park=128×257） */
+function buildTreeValues(features, bbox, res){
+  const intensity = { wood: 255, forest: 230, scrub: 160, park: 128 };
+  const scratch = document.createElement("canvas");
+  scratch.width = res; scratch.height = res;
+  const sctx = scratch.getContext("2d", { willReadFrequently: true });
+  const accum = new Uint8Array(res * res);
+  for(const f of features){
+    const tag = f.tags["leisure"] === "park" ? "park"
+      : f.tags["landuse"] === "forest" ? "forest"
+      : f.tags["natural"] === "wood" ? "wood"
+      : f.tags["natural"] === "scrub" ? "scrub" : null;
+    if(!tag) continue;
+    const v = intensity[tag];
+    sctx.fillStyle = "#000"; sctx.fillRect(0, 0, res, res);
+    sctx.fillStyle = "rgb(" + v + "," + v + "," + v + ")";
+    sctx.beginPath();
+    traceRing(sctx, f.coords, bbox, res);
+    sctx.fill("evenodd");
+    const img = sctx.getImageData(0, 0, res, res).data;
+    for(let i = 0; i < accum.length; i++){
+      const p = img[i*4];
+      if(p > accum[i]) accum[i] = p;
+    }
+  }
+  const out = new Uint16Array(res * res);
+  for(let i = 0; i < out.length; i++) out[i] = accum[i] * 257;
+  return out;
+}
+
+/* SECTION: road-network */
+const ROAD_TYPES = { motorway: "Highway", trunk: "Highway", primary: "Highway",
+  secondary: "Arterial", tertiary: "Arterial", residential: "Local" };
+
+/** 路网 JSON：简化 + 节点合并 + 米制坐标（x=经度米, y=海拔, z=纬度米） */
+function buildRoadNetwork(features, bbox, dem){
+  const origin = bboxCenter(bbox);
+  const nodes = [], segments = [];
+  const idx = new Map();
+  const getNode = (lon, lat) => {
+    const m = lonLatToLocalMeters(lon, lat, origin);
+    const y = dem ? Math.min(Math.max(sampleDEM(dem, lon, lat), 0), 1024) : 0;
+    const key = m[0].toFixed(3) + "," + m[1].toFixed(3);
+    const ex = idx.get(key);
+    if(ex) return ex;
+    const id = "n" + nodes.length;
+    nodes.push({ id, x: +m[0].toFixed(3), y: +y.toFixed(2), z: +m[1].toFixed(3) });
+    idx.set(key, id);
+    return id;
+  };
+  for(const f of features){
+    const type = ROAD_TYPES[f.tags["highway"]];
+    if(!type) continue;
+    const pts = douglasPeucker(f.coords, 0.00005);
+    if(pts.length < 2) continue;
+    let prev = getNode(pts[0][0], pts[0][1]);
+    for(let i = 1; i < pts.length; i++){
+      const cur = getNode(pts[i][0], pts[i][1]);
+      if(prev !== cur) segments.push({ startNodeId: prev, endNodeId: cur, type });
+      prev = cur;
+    }
+  }
+  return { format: "cities-skylines-road-network-v1", nodes, segments };
+}
+
+/* SECTION: write-files */
+async function ensureDir(dir, name){
+  return dir.getDirectoryHandle(name, { create: true });
+}
+async function writeFile(dir, relPath, blob){
+  const parts = relPath.split("/");
+  let d = dir;
+  for(let i = 0; i < parts.length - 1; i++) d = await ensureDir(d, parts[i]);
+  const fh = await d.getFileHandle(parts[parts.length-1], { create: true });
+  const w = await fh.createWritable();
+  await w.write(blob);
+  await w.close();
+}
+
+/* SECTION: ui-logic */
+const logEl = $("log");
+function logLine(text, cls){
+  const line = document.createElement("div");
+  if(cls) line.className = cls;
+  line.textContent = text;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* SECTION: main-flow */
+const RES = 1081;
+const README_TEXT = [
+  "========================================================================",
+  "  Cities: Skylines Map Import Guide / 城市天际线地图导入说明",
+  "========================================================================",
+  "[EN] 1. Open Map Editor -> New Map.",
+  "     2. Import Heightmap: Heightmaps/Map.png (16-bit grayscale).",
+  "     3. Import Water: Maps/Water.png (white=water, black=land).",
+  "     4. Maps/Trees.png = tree density; use with tree brush mod.",
+  "     5. Data/road_network.json = road network; companion C# mod spawns via NetManager.",
+  "[中文] 1. 打开 地图编辑器 → 新地图。",
+  "     2. 导入高度图：Heightmaps/Map.png（16 位灰度）。",
+  "     3. 导入水域图：Maps/Water.png（白=水，黑=陆）。",
+  "     4. Maps/Trees.png 为树木密度图，配合树木 Mod 使用。",
+  "     5. Data/road_network.json 为路网，配套 C# Mod 通过 NetManager 生成道路。",
+  "========================================================================"
+].join("\n");
+
+function bboxLabel(b){
+  return "(" + b[1].toFixed(4) + ", " + b[0].toFixed(4) + ") ~ (" + b[3].toFixed(4) + ", " + b[2].toFixed(4) + ")";
+}
+
+async function generateAll(){
+  [$("genBtn")].forEach(btn => btn.disabled = true);
+  logEl.textContent = ""; $("fileList").textContent = "";
+
+  if(!rootDir){ logLine("请先选择保存目录。", "err"); $("genBtn").disabled = false; return; }
+
+  const lon = parseFloat($("lon").value), lat = parseFloat($("lat").value);
+  if(!isFinite(lon) || !isFinite(lat)){
+    logLine("请填写有效的中心经度与纬度。", "err");
+    $("genBtn").disabled = false;
+    return;
+  }
+
+  const KM_FIXED = 17.28; // C:S1 完整地图固定框 17.28km×17.28km（9×9 格）
+  const bbox = bboxFromCenter(lon, lat, KM_FIXED);
+  logLine("区域: 中心 (" + lon + ", " + lat + ")  地图框 17.28×17.28 km（适配 C:S1）  范围 " + bboxLabel(bbox));
+
+  try{
+    logLine("[1/5] 从 OpenStreetMap 获取道路 / 水体 / 森林…");
+    const features = await fetchOSM(bbox);
+    logLine("      完成：得到 " + features.length + " 个要素。", "ok");
+
+    logLine("[2/5] 从 AWS Terrarium 获取 DEM 高程…");
+    const dem = await fetchTerrainDEM(bbox);
+    logLine("      完成：DEM 栅格 " + dem.width + "×" + dem.height + "。", "ok");
+
+    logLine("[3/5] 生成 1081×1081 高度图 / 水域 / 树木…");
+    const [heightPng, waterPng, treePng] = await Promise.all([
+      encodeGray16PNG(RES, RES, buildHeightmapValues(dem, bbox, RES)),
+      encodeGray16PNG(RES, RES, buildWaterValues(features, bbox, RES)),
+      encodeGray16PNG(RES, RES, buildTreeValues(features, bbox, RES))
+    ]);
+    logLine("      完成。", "ok");
+
+    logLine("[4/5] 生成路网 JSON（Douglas-Peucker 简化 + 节点合并）…");
+    const road = buildRoadNetwork(features, bbox, dem);
+    logLine("      完成：节点 " + road.nodes.length + "，路段 " + road.segments.length + "。", "ok");
+    const roadJson = JSON.stringify(road, null, 1);
+
+    logLine("[5/5] 写入你选择的目录…");
+    await writeFile(rootDir, "Heightmaps/Map.png", new Blob([heightPng], { type: "image/png" }));
+    await writeFile(rootDir, "Maps/Water.png", new Blob([waterPng], { type: "image/png" }));
+    await writeFile(rootDir, "Maps/Trees.png", new Blob([treePng], { type: "image/png" }));
+    await writeFile(rootDir, "Data/road_network.json", new Blob([roadJson], { type: "application/json" }));
+    await writeFile(rootDir, "README_IMPORT_INSTRUCTIONS.txt", new Blob([README_TEXT], { type: "text/plain" }));
+    logLine("全部完成 ✅ 5 个文件已写入 " + rootDir.name + " 目录。", "ok");
+    $("fileList").textContent = "已生成：Heightmaps/Map.png · Maps/Water.png · Maps/Trees.png · Data/road_network.json · README_IMPORT_INSTRUCTIONS.txt";
+  }catch(err){
+    logLine("生成失败：" + (err && err.message ? err.message : err), "err");
+  }finally{
+    $("genBtn").disabled = false;
+  }
+}
+
+/* SECTION: boot */
+(() => {
+  let supported = false;
+  try{
+    if("showDirectoryPicker" in window && "CompressionStream" in window) supported = true;
+  }catch(e){ /* 忽略 */ }
+  $("compatNote").textContent = supported
+    ? "✓ 兼容。点击「选择目录」决定保存位置，再点「生成地图」。"
+    : "⚠ 当前浏览器不支持「选择目录写入文件」（需桌面版 Chrome / Edge）。请改用 Chrome 或 Edge 打开本文件。";
+
+  $("pickDirBtn").addEventListener("click", async () => {
+    try{
+      rootDir = await window.showDirectoryPicker({ mode: "readwrite" });
+      logLine("已选择目录：" + rootDir.name, "ok");
+    }catch(err){
+      if(err && err.name !== "AbortError") logLine("选择目录失败：" + err.message, "err");
+    }
+  });
+
+  $("genBtn").addEventListener("click", () => generateAll());
+})();
+</script>
+</body>
+</html>
