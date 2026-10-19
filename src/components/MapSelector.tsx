@@ -53,11 +53,12 @@ export default function MapSelector() {
     map.addControl(draw as unknown as mapboxgl.Control, "top-left");
     map.addControl(new mapboxgl.NavigationControl(), "top-left");
 
-    // @types 缺失 on/off 方法声明，运行时存在（继承自 Evented）
-    const drawEvents = draw as unknown as {
+    // mapbox-gl-draw 的 draw.* 事件通过 map 实例派发（非 draw 实例）：
+    // 官方用法 map.on('draw.create', handler)。类型上用断言扩展事件名。
+    const mapEvents = map as unknown as {
       on: (event: "draw.create", callback: (e: DrawCreateEvent) => void) => void;
     };
-    drawEvents.on("draw.create", (e: DrawCreateEvent) => {
+    mapEvents.on("draw.create", (e: DrawCreateEvent) => {
       void handleDrawCreate(e);
     });
 
