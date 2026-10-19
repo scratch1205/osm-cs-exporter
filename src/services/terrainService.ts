@@ -285,27 +285,23 @@ export function generateHeightmap(
   const cellLat =
     (demData.bbox[2] - demData.bbox[0]) / Math.max(1, demData.height - 1);
 
-  // 第一遍：采样并统计 min/max
+  // 采样全部像素（绝对海拔米，不做归一化）
   const sampled = new Float32Array(resolution * resolution);
-  let min = Infinity;
-  let max = -Infinity;
   for (let py = 0; py < resolution; py++) {
     const lat = north - ((north - south) * py) / (resolution - 1);
     for (let px = 0; px < resolution; px++) {
       const lon = west + ((east - west) * px) / (resolution - 1);
-      const value = sampleDEM(demData, lon, lat, cellLon, cellLat);
-      sampled[py * resolution + px] = value;
-      if (value < min) min = value;
-      if (value > max) max = value;
+      sampled[py * resolution + px] = sampleDEM(demData, lon, lat, cellLon, cellLat);
     }
   }
 
-  // 第二遍：min→0，max→65535 线性映射
-  const range = max - min;
+  // C:S 固定映射：16 位值 = 海拔米 × 64（0→0m，65535→1024m，默认海平面 40m=2560）。
+  // 必须保留绝对海拔——归一化会把真实地形拉伸成假山。
   const values = new Uint16Array(resolution * resolution);
   for (let i = 0; i < sampled.length; i++) {
-    values[i] =
-      range <= 0 ? 0 : Math.round(((sampled[i] - min) / range) * 65535);
+    const clamped = Math.min(Math.max(sampled[i], 0), 1024); // 海平面下→0，>1024m→65535
+    // 注意：1024m×64=65536 会溢出 Uint16（变 0），必须 clamp 到 65535
+    values[i] = Math.min(Math.round(clamped * 64), 65535);
   }
 
   const canvas = canvasFactory();

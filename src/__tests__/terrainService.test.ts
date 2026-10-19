@@ -144,7 +144,7 @@ describe("fetchDEMData", () => {
 });
 
 describe("generateHeightmap", () => {
-  it("将海拔线性映射到 0-65535 并写入 canvas R/G 通道", () => {
+  it("按 C:S 固定映射写入 16 位值：像素值 = 海拔米 × 64（不做归一化）", () => {
     // 2x2 DEM：西北 0m，东北 100m，西南 50m，东南 200m
     const dem: DEMData = {
       width: 2,
@@ -163,16 +163,35 @@ describe("generateHeightmap", () => {
     // (0,0)=0m → 0 → R=0 G=0
     expect(img.data[px(0, 0)]).toBe(0);
     expect(img.data[px(0, 0) + 1]).toBe(0);
-    // (1,0)=100m → 32768 → R=128 G=0
-    expect(img.data[px(1, 0)]).toBe(128);
+    // (1,0)=100m → 100×64=6400 → R=25 G=0
+    expect(img.data[px(1, 0)]).toBe(25);
     expect(img.data[px(1, 0) + 1]).toBe(0);
-    // (0,1)=50m → 16384 → R=64 G=0
-    expect(img.data[px(0, 1)]).toBe(64);
-    // (1,1)=200m → 65535 → R=255 G=255
-    expect(img.data[px(1, 1)]).toBe(255);
-    expect(img.data[px(1, 1) + 1]).toBe(255);
+    // (0,1)=50m → 3200 → R=12 G=128
+    expect(img.data[px(0, 1)]).toBe(12);
+    expect(img.data[px(0, 1) + 1]).toBe(128);
+    // (1,1)=200m → 12800 → R=50 G=0
+    expect(img.data[px(1, 1)]).toBe(50);
+    expect(img.data[px(1, 1) + 1]).toBe(0);
     // Alpha 恒为 255
     expect(img.data[px(0, 0) + 3]).toBe(255);
+  });
+
+  it("负海拔钳制为 0；超过 1024m 钳制为 65535；40m（默认海平面）=2560", () => {
+    const dem: DEMData = {
+      width: 2,
+      height: 2,
+      elevations: new Float32Array([-30, 2000, 1024, 40]),
+      bbox: [0, 0, 10, 10],
+    };
+    const canvas = createCanvas(2, 2) as unknown as HTMLCanvasElement;
+    generateHeightmap(dem, [0, 0, 10, 10], 2, () => canvas);
+    const img = canvas.getContext("2d")!.getImageData(0, 0, 2, 2);
+    const view = (x: number, y: number) => (y * 2 + x) * 4;
+    expect(img.data[view(0, 0)]).toBe(0);          // -30m → 0
+    expect(img.data[view(1, 0)]).toBe(255);        // 2000m → clamp→65535
+    expect(img.data[view(0, 1)]).toBe(255);        // 1024m → 65535
+    expect(img.data[view(1, 1)]).toBe(10);         // 40m → 2560 → R=10
+    expect(img.data[view(1, 1) + 1]).toBe(0);
   });
 
   it("维度映射：north→上、west→左、east→右、south→下", () => {
@@ -193,7 +212,7 @@ describe("generateHeightmap", () => {
     expect(northBrightness).toBeGreaterThan(southBrightness);
   });
 
-  it("平原（min==max）输出全 0", () => {
+  it("平原（50m）按绝对海拔输出 3200 而非 0", () => {
     const dem: DEMData = {
       width: 2,
       height: 2,
@@ -205,9 +224,10 @@ describe("generateHeightmap", () => {
     generateHeightmap(dem, [0, 0, 10, 10], 2, () => canvas);
 
     const img = canvas.getContext("2d")!.getImageData(0, 0, 2, 2);
+    // 50m 绝对海拔 → 50×64=3200 → R=12 G=128（不做归一化，平原保持真实海拔）
     for (let i = 0; i < 4; i++) {
-      expect(img.data[i * 4]).toBe(0);
-      expect(img.data[i * 4 + 1]).toBe(0);
+      expect(img.data[i * 4]).toBe(12);
+      expect(img.data[i * 4 + 1]).toBe(128);
     }
   });
 
