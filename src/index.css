@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Mapbox GL Draw override styles */
+.mapboxgl-ctrl-group {
+  border-radius: 8px !important;
+}
